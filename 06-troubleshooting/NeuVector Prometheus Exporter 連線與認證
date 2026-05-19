@@ -1,0 +1,158 @@
+# 故障排除與部署手冊：NeuVector Prometheus Exporter 連線與認證
+
+本文件旨在解決 NeuVector Prometheus Exporter 在與 NeuVector Controller 連接時常見的**網域名稱解析錯誤 (DNS)** 與 **認證失敗 (Authentication)** 問題，並提供生產環境的標準操作流程 (SOP)。
+
+---
+
+## 📌 RAG 檢索元數據 (Metadata)
+
+* **分類 (Category):** Kubernetes Security, Monitoring, Troubleshooting
+* **關鍵字 (Keywords):** NeuVector, Prometheus Exporter, NameResolutionError, Authentication failed, Helm, K8s Secret
+* **目標組件 (Target):** `neuvector-svc-controller-api`, `neuvector-prometheus-exporter-pod`
+
+---
+
+## 🛑 問題一：無法解析控制器服務 (NameResolutionError)
+
+### 1. 異常現象描述
+
+Exporter 容器日誌出現以下錯誤，且在叢集內找不到名為 `neuvector-svc-controller-api` 的 Service：
+
+```text
+HTTPSConnectionPool(host='neuvector-svc-controller-api', port=10443): Max retries exceeded with url: /v1/auth (Caused by NameResolutionError(... Failed to resolve 'neuvector-svc-controller-api'))
+
+```
+
+### 2. 根本原因 (Root Cause)
+
+NeuVector 官方 Helm Chart 在預設情況下，`controller.apisvc.type` 參數為 `nil`（未啟用）。因此，叢集內不會自動建立供外部或 Exporter 連線的 REST API Service 節點。
+
+### 3. 解決方案 (二選一)
+
+#### 方案 A：使用 Helm 更新現有配置（推薦）
+
+在終端機執行以下命令，啟用 API 服務並將其類型設為 `ClusterIP`：
+
+```bash
+helm upgrade neuvector neuvector/core \
+  --namespace neuvector \
+  --reuse-values \
+  --set controller.apisvc.type=ClusterIP
+
+```
+
+#### 方案 B：手動建立 Service 資源
+
+若不方便更新 Helm，可直接將以下 YAML 內容儲存為 `neuvector-api-svc.yaml` 並套用：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: neuvector-svc-controller-api
+  namespace: neuvector
+spec:
+  ports:
+  - port: 10443
+    name: controller-api
+    protocol: TCP
+    targetPort: 10443
+  type: ClusterIP
+  selector:
+    app: neuvector-controller-pod
+
+```
+
+```bash
+kubectl apply -f neuvector-api-svc.yaml
+
+```
+
+---
+
+## 🛑 問題二：控制器認證失敗 (Authentication Failed)
+
+### 1. 異常現象描述
+
+解決 DNS 解析問題後，Exporter 日誌變更為以下錯誤：
+
+```text
+Login to controller ...
+Authentication failed
+
+```
+
+### 2. 根本原因 (Root Cause)
+
+Prometheus Exporter 預設會嘗試使用舊有的預設憑證（`admin` / `admin`）進行登入。若 NeuVector 控制器的密碼已被修改，或叢集在初始化時啟用了安全隨機密碼，Exporter 將因密碼錯誤被控制器拒絕連線。
+
+### 3. 快速解決方案
+
+更新 Helm 的 Exporter 配置，將 `<YOUR_ACTUAL_PASSWORD>` 替換為當前的管理者密碼：
+
+```bash
+helm upgrade neuvector neuvector/core \
+  --namespace neuvector \
+  --reuse-values \
+  --set exporter.CTRL_PASSWORD="<YOUR_ACTUAL_PASSWORD>"
+
+```
+
+---
+
+## 🛠️ 生產環境安全部署 SOP (標準操作流程)
+
+為了避免將密碼以明文形式暴露在 Helm 命令或腳本中，並遵循最小權限原則，請務必按照以下 SOP 進行生產環境部署：
+
+### 步驟一：於 UI 建立專用唯讀帳戶
+
+1. 登入 **NeuVector 網頁控制台 (UI)**。
+2. 導航至 **Settings (設定)** > **Users & Roles (使用者與角色)**。
+3. 新增一個使用者（例如：`prometheus-scraper`）。
+4. 將該帳戶的角色權限設定為 **Global Read-Only (全域唯讀)** 或 **View-Only**。
+
+### 步驟二：建立 K8s 加密憑證 (Secret)
+
+在 Kubernetes 中建立安全的 Secret，用來儲存剛剛建立的唯讀帳戶憑證：
+
+```bash
+kubectl create secret generic nv-exporter-creds \
+  --namespace neuvector \
+  --from-literal=CTRL_USERNAME="prometheus-scraper" \
+  --from-literal=CTRL_PASSWORD="<該帳戶的密碼>"
+
+```
+
+### 步驟三：透過 Helm 綁定 Secret 部署
+
+使用 `exporter.ctrlSecretName` 參數，讓 Exporter Pod 自動讀取剛建立的 Secret：
+
+```bash
+helm upgrade neuvector neuvector/core \
+  --namespace neuvector \
+  --reuse-values \
+  --set exporter.ctrlSecretName="nv-exporter-creds"
+
+```
+
+### 步驟四：跨命名空間 (Cross-Namespace) 檢查
+
+> ⚠️ **重要注意事項**
+> 若你的 Prometheus Exporter 與 NeuVector Controller 部署在**不同的命名空間**，請務必確認 Exporter 的連線設定已改為 **FQDN 全名**，否則網域名稱將再次無法解析。
+
+* **同命名空間：** `neuvector-svc-controller-api`
+* **跨命名空間：** `neuvector-svc-controller-api.neuvector.svc.cluster.local`
+
+---
+
+## 🔍 驗證流程 (Verification)
+
+1. **檢查 Pod 狀態：** 確保 Exporter Pod 已成功重啟且狀態為 `Running`。
+2. **檢查日誌：** 執行以下命令確認無報錯，且顯示成功抓取指標。
+```bash
+kubectl logs -l app=neuvector-prometheus-exporter-pod -n neuvector
+
+```
+
+
+3. **驗證 Metrics 端點：** 確認可以對 Exporter 的 `9443`（或自訂連接埠）進行 curl 測試並成功返回 Prometheus 格式數據。

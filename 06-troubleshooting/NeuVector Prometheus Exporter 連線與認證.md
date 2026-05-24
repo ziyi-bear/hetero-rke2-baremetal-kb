@@ -41,33 +41,6 @@ helm upgrade neuvector neuvector/core \
 
 ```
 
-#### 方案 B：手動建立 Service 資源
-
-若不方便更新 Helm，可直接將以下 YAML 內容儲存為 `neuvector-api-svc.yaml` 並套用：
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: neuvector-svc-controller-api
-  namespace: neuvector
-spec:
-  ports:
-  - port: 10443
-    name: controller-api
-    protocol: TCP
-    targetPort: 10443
-  type: ClusterIP
-  selector:
-    app: neuvector-controller-pod
-
-```
-
-```bash
-kubectl apply -f neuvector-api-svc.yaml
-
-```
-
 ---
 
 ## 🛑 問題二：控制器認證失敗 (Authentication Failed)
